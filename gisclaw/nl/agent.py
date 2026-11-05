@@ -1,0 +1,568 @@
+"""
+gisclaw/nl/agent.py
+============================
+# Copyright (c) 2025 UrbanComp Lab (https://urbancomp.net) — MIT License
+
+GeoAgent — 多轮自然语言对话 GIS 代理
+
+将 NLProcessor（解析）+ NLExecutor（执行）组合为完整的对话代理，
+支持多轮交互、上下文保持、模糊确认、结果解释。
+
+核心功能:
+  - 单入口 chat(text) 完成 解析→确认→执行→反馈 全流程
+  - 跨轮对话上下文（图层、上一步结果、操作历史）
+  - 低置信度时主动询问确认
+  - 每轮自动更新 Memory 短期/长期记忆
+
+Copyright (c) 2025 UrbanComp Lab (https://urbancomp.net) — MIT License
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from gisclaw.nl.processor import NLProcessor, ParsedIntent
+from gisclaw.nl.executor  import NLExecutor, ExecutionResult
+from gisclaw.nl.profile_manager import ProfileManager
+
+
+# ── 对话消息 ──────────────────────────────────────────────────────────────────
+
+@dataclass
+class ChatMessage:
+    role:    str    # "user" | "agent"
+    text:    str
+    intent:  Optional[ParsedIntent]   = None
+    result:  Optional[ExecutionResult] = None
+    ts:      float = field(default_factory=time.time)
+
+    def __repr__(self) -> str:
+        return f"[{self.role}] {self.text[:80]}"
+
+
+# ── GeoAgent ──────────────────────────────────────────────────────────────────
+
+class GeoAgent:
+    """
+    多轮自然语言 GIS 对话代理。
+
+    Usage::
+
+        agent = GeoAgent(api_key="sk-...")
+
+        # 单轮
+        print(agent.chat("加载 hospitals.geojson"))
+        print(agent.chat("对医院做1公里缓冲区"))
+        print(agent.chat("然后可视化"))
+
+        # 批量（脚本模式）
+        for text in ["加载...", "缓冲...", "制图..."]:
+            result = agent.run(text)
+
+        # 查看历史
+        agent.print_history()
+    """
+
+    # 低置信度阈值：低于此值则请求确认
+    CONFIRM_THRESHOLD = 0.55
+
+    def __init__(
+        self,
+        api_key:    Optional[str] = None,
+        use_ai:     Optional[bool] = None,
+        verbose:    bool = False,
+        session_id: Optional[str] = None,
+        output_dir: Optional[str] = None,
+        soul_path:  Optional[str] = None,
+        user_path:  Optional[str] = None,
+    ):
+        """
+        Args:
+            api_key   : Anthropic API Key
+            use_ai    : True=AI模式, False=规则模式, None=自动
+            verbose   : 打印调试信息
+            session_id: 记忆会话 ID
+            output_dir: 覆盖默认输出目录；None 则使用 config.output_dir
+            soul_path : soul.md 路径；None 则使用 ~/.gisclaw/soul.md
+            user_path : user.md 路径；None 则使用 ~/.gisclaw/user.md
+        """
+        # ── 加载 soul.md / user.md 个性化配置层 ──────────────────────────────
+        self.profile = ProfileManager(
+            soul_path=Path(soul_path) if soul_path else None,
+            user_path=Path(user_path) if user_path else None,
+            auto_create=True,
+        ).load()
+
+        # ── ProfileUpdater：对话中动态更新 soul.md / user.md ─────────────────
+        from gisclaw.nl.profile_manager import ProfileUpdater
+        self._profile_updater = ProfileUpdater(self.profile, verbose=verbose)
+
+        self._proc = NLProcessor(api_key=api_key, use_ai=use_ai, verbose=verbose)
+        self._exec = NLExecutor(memory_session=session_id, verbose=verbose,
+                                output_dir=output_dir)
+        # 把 LLM 引用注入 executor，供 ReAct 使用
+        if self._proc._llm is not None:
+            self._exec._llm = self._proc._llm
+        self._history: List[ChatMessage] = []
+        self._pending_intent: Optional[ParsedIntent] = None   # 等待确认的意图
+        self.verbose = verbose
+
+        mode = "AI" if self._proc._use_ai else "规则"
+        # 使用 ProfileManager 生成个性化欢迎语
+        welcome = self.profile.build_welcome_message(mode=mode)
+        self._add_agent_msg(welcome)
+
+    # ── 主对话入口 ────────────────────────────────────────────────────────────
+
+    def chat(self, text: str) -> str:
+        """
+        输入一条自然语言指令，返回代理回复文本。
+
+        完整流程:
+          1. 记录用户消息
+          2. 若有等待确认的意图，处理确认/拒绝
+          3. 解析新意图
+          4. 低置信度 → 返回确认问题
+          5. 高置信度 → 执行并返回结果
+        """
+        text = text.strip()
+        self._history.append(ChatMessage(role="user", text=text))
+
+        # ── 处理待确认意图 ────────────────────────────────────────────────────
+        if self._pending_intent is not None:
+            return self._handle_confirmation(text)
+
+        # ── 检测 profile 更新意图（优先于 GIS 操作解析）─────────────────────
+        profile_result = self._profile_updater.maybe_update(text)
+        if profile_result is not None:
+            if profile_result.blocked:
+                return self._add_agent_msg(f"[安全锁定] {profile_result.message}")
+            # 如果有实质字段更新，记录后继续走 chat/NL 流程给用户回应
+            # 只有纯偏好设置类（没有其他意图）才直接返回确认消息
+            _EXPLICIT_PREF_PATTERNS = [
+                r"记住.*(?:偏好|习惯|设置)",
+                r"帮我?更新.*(?:profile|user\.md|偏好)",
+                r"设置我?的.*(?:语言|风格)",
+                r"以后.*(?:用|使用|采用)",
+                r"请用(?:英文|中文)回复",
+            ]
+            import re as _re
+            is_explicit_pref = any(_re.search(p, text) for p in _EXPLICIT_PREF_PATTERNS)
+            if is_explicit_pref:
+                return self._add_agent_msg(profile_result.message)
+            # 自我介绍/研究背景类：更新 profile 后，附加上下文继续回答用户
+            # 把 profile 更新消息附加到上下文，然后走 chat 流程
+            if profile_result.changed:
+                self._add_agent_msg(profile_result.message)
+            # 继续走后续解析流程给用户实质回应
+
+        # ── 解析意图 ──────────────────────────────────────────────────────────
+        context = self._build_context()
+        intent  = self._proc.parse(text, context=context)
+
+        # ── 置信度过低 → 请求确认 ────────────────────────────────────────────
+        if intent.confidence < self.CONFIRM_THRESHOLD and intent.action != "unknown":
+            self._pending_intent = intent
+            reply = (
+                f"我理解你想要：{intent.explanation}\n"
+                f"（置信度 {intent.confidence:.0%}，操作：{intent.action}）\n"
+                f"是否执行？(是/否)"
+            )
+            return self._add_agent_msg(reply, intent=intent)
+
+        # ── 自由对话（chat action）────────────────────────────────────────────
+        if intent.action == "chat":
+            reply = intent.params.get("reply", "")
+            if not reply and self._proc._llm is not None:
+                # 直接用 LLM 生成自然语言回复
+                try:
+                    alive_sys = self._build_alive_system_prompt()
+                    resp = self._proc._llm.chat(
+                        messages=[{"role": "user", "content": text}],
+                        system=alive_sys,
+                    )
+                    reply = resp.content if resp else "嗯，说来听听？"
+                except Exception:
+                    reply = "嗯，有什么 GIS 问题想聊？"
+            if not reply:
+                reply = "有什么 GIS 分析需要帮忙？"
+            return self._add_agent_msg(reply, intent=intent)
+
+        # ── 无法识别 ──────────────────────────────────────────────────────────
+        if intent.action == "unknown":
+            # AI 模式下：直接用 LLM 生成回复，不抛出固定错误
+            if self._proc._use_ai and self._proc._llm is not None:
+                try:
+                    alive_sys = self._build_alive_system_prompt()
+                    resp = self._proc._llm.chat(
+                        messages=[{"role": "user", "content": text}],
+                        system=alive_sys,
+                    )
+                    reply = resp.content if resp else f"没太理解「{text}」，能换个说法吗？"
+                    return self._add_agent_msg(reply, intent=intent)
+                except Exception:
+                    pass
+            reply = (
+                f"抱歉，我无法理解：「{text}」\n"
+                f"提示：{intent.params.get('reason', '')}\n"
+                f"输入「帮助」查看支持的操作。"
+            )
+            return self._add_agent_msg(reply, intent=intent)
+
+        # ── 执行 ──────────────────────────────────────────────────────────────
+        return self._execute_and_reply(intent)
+
+    def run(self, text: str) -> ExecutionResult:
+        """
+        脚本模式：直接执行，不做确认，返回 ExecutionResult。
+        """
+        context = self._build_context()
+        intent  = self._proc.parse(text, context=context)
+        result  = self._exec.execute_intent(intent)
+        self._history.append(ChatMessage(
+            role="agent", text=result.summary(), intent=intent, result=result
+        ))
+        return result
+
+    # ── 内部方法 ──────────────────────────────────────────────────────────────
+
+    def _handle_confirmation(self, text: str) -> str:
+        intent = self._pending_intent
+        self._pending_intent = None
+        YES = {"是", "yes", "y", "确认", "执行", "好", "好的", "对", "ok"}
+        NO  = {"否", "no", "n", "取消", "不", "不要", "算了"}
+        t   = text.lower().strip()
+        if t in YES or any(y in t for y in YES):
+            return self._execute_and_reply(intent)
+        elif t in NO or any(n in t for n in NO):
+            return self._add_agent_msg("已取消操作。请重新描述你想做什么。")
+        else:
+            # 当做新指令处理
+            self._pending_intent = None
+            return self.chat(text)
+
+    def _execute_and_reply(self, intent: ParsedIntent) -> str:
+        er = self._exec.execute_intent(intent)
+        if er.success:
+            reply = self._format_success(intent, er)
+        else:
+            reply = self._format_error(intent, er)
+        return self._add_agent_msg(reply, intent=intent, result=er)
+
+    def _format_success(self, intent: ParsedIntent, er: ExecutionResult) -> str:
+        msg = er.message or ""
+        lines = [f"✓ {msg}" if not msg.startswith("✓") else msg]
+        # 展示结果摘要
+        result = er.result
+        if result is not None:
+            if hasattr(result, "__len__") and hasattr(result, "data"):
+                # GeoLayer
+                try:
+                    cols = list(result.data.columns)[:5]
+                    lines.append(f"  要素数: {len(result)}  字段: {cols}")
+                except Exception:
+                    pass
+            elif isinstance(result, dict):
+                # render 结果已在 message 中显示，跳过
+                if intent.action in ("render", "render_interactive"):
+                    pass
+                # skill_run 返回 dict：只显示图层摘要行，跳过大字段（report/density矩阵等）
+                elif intent.action == "skill_run":
+                    from gisclaw.core.layer import GeoLayer as _GL
+                    for k, v in result.items():
+                        if isinstance(v, _GL):
+                            lines.append(f"  {k}: {repr(v)}")
+                        elif isinstance(v, str) and len(v) > 120:
+                            # 长字符串（报告文本）只取前两行
+                            preview = v.strip().split("\n")[0][:80]
+                            lines.append(f"  {k}: {preview}…")
+                        elif isinstance(v, dict) and ("grid" in v or "xx" in v):
+                            pass  # 跳过密度矩阵 dict
+                        elif callable(v):
+                            pass
+                        elif hasattr(v, "__len__") and not isinstance(v, str) and len(v) > 20:
+                            pass  # 跳过大型数组
+                        else:
+                            lines.append(f"  {k}: {v}")
+                # KDE / 栅格结果特殊处理：只显示摘要，不输出原始矩阵
+                elif "grid" in result and "extent" in result:
+                    import numpy as np
+                    grid = result["grid"]
+                    ext = result["extent"]
+                    gs = grid.shape[0] if hasattr(grid, "shape") else "?"
+                    vmax = float(np.max(grid)) if hasattr(grid, "max") else "?"
+                    lines.append(f"  网格: {gs}×{gs}  密度峰值: {vmax:.6f}")
+                    lines.append(f"  范围: ({ext[0]:.4f}, {ext[1]:.4f}) ~ ({ext[2]:.4f}, {ext[3]:.4f})")
+                else:
+                    import numpy as np
+                    for k, v in list(result.items())[:4]:
+                        if callable(v):
+                            continue
+                        # 跳过大型数组
+                        if hasattr(v, "__len__") and not isinstance(v, str) and len(v) > 20:
+                            lines.append(f"  {k}: [{type(v).__name__}, {len(v)} items]")
+                        else:
+                            lines.append(f"  {k}: {v}")
+        # 提示当前可用图层
+        available = self._exec.list_layers()
+        if available:
+            lines.append(f"  当前图层: {', '.join(available[-3:])}")
+        lines.append(f"  耗时: {er.duration:.2f}s")
+        return "\n".join(lines)
+
+    def _format_error(self, intent: ParsedIntent, er: ExecutionResult) -> str:
+        lines = [f"✗ 操作失败: {er.error}"]
+        available = self._exec.list_layers()
+        if available:
+            lines.append(f"  可用图层: {', '.join(available)}")
+        lines.append("  输入「帮助」查看使用示例。")
+        return "\n".join(lines)
+
+    def _build_context(self) -> Dict[str, Any]:
+        """构建传给解析器的上下文（含上下文压缩 + soul/user 个性化 + 记忆注入）。"""
+        ctx: Dict[str, Any] = {}
+        layers = self._exec.list_layers()
+        if layers:
+            ctx["available_layers"] = layers
+        last = self._exec.last_result
+        if last is not None and hasattr(last, "name"):
+            ctx["last_layer"] = last.name
+
+        # ── 注入 soul.md 系统提示（行为边界，高优先级）───────────────────────
+        soul_prompt = self.profile.build_system_prompt()
+        if soul_prompt:
+            ctx["soul_system_prompt"] = soul_prompt
+
+        # ── 注入 user.md 偏好提示（软个性化，不覆盖 soul 边界）─────────────
+        user_hint = self.profile.build_context_hint()
+        if user_hint:
+            ctx["user_profile_hint"] = user_hint
+
+        # ── 注入长期记忆摘要（跨会话）──────────────────────────────────────
+        try:
+            mem_summary = self._build_memory_context()
+            if mem_summary:
+                ctx["long_term_memory"] = mem_summary
+        except Exception:
+            pass
+
+        # 构建对话消息列表并压缩
+        messages = self._history_to_messages()
+        if messages:
+            try:
+                from gisclaw.nl.context_compress import (
+                    compress_if_needed, CompressConfig
+                )
+                from gisclaw.config import Config
+                cfg = Config.load()
+                cc = CompressConfig(
+                    max_tokens=cfg.ctx_max_tokens,
+                    target_tokens=cfg.ctx_target_tokens,
+                    keep_recent=cfg.ctx_keep_recent,
+                )
+                compressed, report = compress_if_needed(
+                    messages, verbose=cfg.ctx_compress_verbose, config=cc
+                )
+                if report.level_applied > 0:
+                    ctx["compressed_history"] = compressed
+                    ctx["compress_report"] = str(report)
+                    if self.verbose:
+                        print(f"  [Agent] 上下文已压缩: {report}")
+                else:
+                    recent = [m["content"] for m in messages[-4:]
+                              if m.get("role") == "user"]
+                    if recent:
+                        ctx["recent_user_inputs"] = recent
+            except Exception:
+                recent = [m.text for m in self._history[-4:] if m.role == "user"]
+                if recent:
+                    ctx["recent_user_inputs"] = recent
+        return ctx
+
+    def _history_to_messages(self) -> List[Dict[str, str]]:
+        """将 _history 转为 LLM messages 格式（供压缩器使用）。"""
+        msgs = []
+        for m in self._history:
+            if m.role == "user":
+                msgs.append({"role": "user", "content": m.text})
+            elif m.role == "agent":
+                msgs.append({"role": "assistant", "content": m.text})
+        return msgs
+
+    # ── 记忆上下文构建 ──────────────────────────────────────────────────────────
+
+    def _build_memory_context(self) -> str:
+        """
+        构建注入对话的记忆上下文字符串。
+        整合：① 今日短期操作摘要 ② 长期记忆相关片段 ③ 历史复盘关键词。
+        用于赋予 GISClaw「活人感」—— 记得你，记得你做过什么，记得你的习惯。
+        """
+        parts = []
+
+        # 1. 今日会话短期摘要（当前会话操作序列）
+        try:
+            mem = self._exec._mem
+            op_log = mem.short.get_operation_log() if hasattr(mem, "short") else []
+            if op_log:
+                ops_summary = ", ".join(
+                    f"{r.get('action', r.get('function', '?'))}"
+                    for r in op_log[-6:]
+                )
+                parts.append(f"本次会话已执行操作: {ops_summary}")
+        except Exception:
+            pass
+
+        # 2. 长期记忆 —— 最近会话复盘摘要（跨天记忆）
+        try:
+            lt = self._exec._mem.long if hasattr(self._exec._mem, "long") else None
+            if lt is not None:
+                # 按重要性+近期优先取最多3条session摘要
+                recent_sessions = lt.search(
+                    query="session analysis workflow",
+                    category="session",
+                    top_k=3,
+                )
+                if recent_sessions:
+                    session_hints = []
+                    for s in recent_sessions:
+                        title = getattr(s, 'title', '')
+                        snippet = str(str(getattr(s, 'content', ''))[:100])[:80]
+                        session_hints.append(f"[{title}] {snippet}")
+                    if session_hints:
+                        parts.append("历史分析记录:\n  " + "\n  ".join(session_hints))
+        except Exception:
+            pass
+
+        # 3. 用户偏好长期记忆
+        try:
+            lt = self._exec._mem.long if hasattr(self._exec._mem, "long") else None
+            if lt is not None:
+                pref_entries = lt.search(query="user preference", category="preference", top_k=2)
+                if pref_entries:
+                    pref_snippets = [str(str(getattr(e, 'content', ''))[:80])[:60] for e in pref_entries]
+                    parts.append("用户习惯偏好: " + " | ".join(pref_snippets))
+        except Exception:
+            pass
+
+        return "\n".join(parts) if parts else ""
+
+    def _build_alive_system_prompt(self) -> str:
+        """
+        构建「活人感」系统提示词。
+        融合 soul.md、user.md、当日对话记忆、长期记忆复盘。
+        供 chat action 的 LLM 调用使用。
+        """
+        soul_text = self.profile.build_system_prompt() or ""
+        user_hint = self.profile.build_context_hint() or ""
+        mem_ctx   = ""
+        try:
+            mem_ctx = self._build_memory_context()
+        except Exception:
+            pass
+
+        # 当前对话轮次
+        turns = len([m for m in self._history if m.role == "user"])
+        # 用户角色
+        user_role = getattr(self.profile.user, "role", "研究人员")
+        user_name = getattr(self.profile.user, "name", "")
+        name_hint = f"用户名: {user_name}。" if user_name else ""
+
+        system = (
+            f"{soul_text}\n\n"
+            f"## 当前对话状态\n"
+            f"{name_hint}用户角色: {user_role}。本次对话已进行 {turns} 轮。\n"
+        )
+        if user_hint:
+            system += f"\n## 用户偏好\n{user_hint}\n"
+        if mem_ctx:
+            system += f"\n## 记忆上下文\n{mem_ctx}\n"
+        system += (
+            "\n## 对话风格要求\n"
+            "你是 GISClaw，一个有记忆、有个性的 GIS 分析助手。\n"
+            "- 记住用户说过的事，自然地在对话中引用（不要刻意强调'你刚才说过'）。\n"
+            "- 语气自然亲切，像一个熟悉的同事，而不是冷冰冰的系统。\n"
+            "- 对 GIS 话题有见解，可以主动提建议、问题或延伸思考。\n"
+            "- 保持专业但有温度，中文优先，技术问题给准确答案。\n"
+            "- 不要重复说'有什么我可以帮你的'，自然对话即可。"
+        )
+        return system
+
+    def context_stats(self) -> dict:
+        """返回当前上下文 token 估算统计。"""
+        try:
+            from gisclaw.nl.context_compress import estimate_messages_tokens
+            msgs = self._history_to_messages()
+            return {
+                "messages": len(msgs),
+                "estimated_tokens": estimate_messages_tokens(msgs),
+                "provider": (self._proc._llm.provider_name
+                             if self._proc._llm else "rule-based"),
+            }
+        except Exception:
+            return {"messages": len(self._history), "estimated_tokens": 0}
+
+    def _add_agent_msg(
+        self,
+        text:   str,
+        intent: Optional[ParsedIntent]    = None,
+        result: Optional[ExecutionResult] = None,
+    ) -> str:
+        self._history.append(ChatMessage(role="agent", text=text,
+                                          intent=intent, result=result))
+        return text
+
+    # ── 历史 / 状态 ───────────────────────────────────────────────────────────
+
+    def print_history(self) -> None:
+        """打印对话历史。"""
+        print("\n  ── 对话历史 " + "─" * 38)
+        for msg in self._history:
+            prefix = "  👤" if msg.role == "user" else "  🤖"
+            for i, line in enumerate(msg.text.split("\n")):
+                print(f"{prefix if i == 0 else '    '} {line}")
+        print("  " + "─" * 48 + "\n")
+
+    def status(self) -> dict:
+        """返回代理当前状态。"""
+        s = {
+            "mode":            "AI" if self._proc._use_ai else "规则",
+            "turns":           len([m for m in self._history if m.role == "user"]),
+            "layers":          self._exec.list_layers(),
+            "ops_success":     sum(1 for r in self._exec.history if r.success),
+            "ops_total":       len(self._exec.history),
+            "pending_confirm": self._pending_intent is not None,
+            "soul_loaded":     bool(self.profile.soul.raw),
+            "user_loaded":     bool(self.profile.user.raw),
+            "user_role":       self.profile.user.role,
+            "user_lang":       self.profile.user.preferred_lang,
+        }
+        return s
+
+    def end(self, title: str = "", auto_update_profile: bool = True) -> None:
+        """
+        结束会话，写入长期记忆，并可选地根据对话内容自动更新 user.md。
+
+        Args:
+            title             : 会话标题
+            auto_update_profile: 是否根据对话历史自动更新 user.md（默认 True）
+        """
+        self._exec.end_session(title=title)
+
+        # 对话结束时自动提取偏好并更新 user.md
+        if auto_update_profile and len(self._history) >= 2:
+            turns = [
+                {"role": m.role, "content": m.text}
+                for m in self._history
+            ]
+            llm = self._proc._llm_provider if hasattr(self._proc, "_llm_provider") else None
+            results = self._profile_updater.summarize_and_update(turns, llm_provider=llm)
+            if results and self.verbose:
+                for r in results:
+                    print(f"  [end] {r.message}")
+
+    def __repr__(self) -> str:
+        s = self.status()
+        return (f"GeoAgent(mode={s['mode']}, turns={s['turns']}, "
+                f"layers={s['layers']})")

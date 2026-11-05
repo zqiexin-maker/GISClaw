@@ -1,0 +1,12 @@
+GISClaw
+-------
+
+Based on GeoClaw_Claude by UrbanComp Lab:
+https://github.com/whuyao/GeoClaw_Claude
+
+Copyright (c) 2025 UrbanComp Lab, https://urbancomp.net
+The upstream source files and README declare the MIT License.
+Original copyright notices and algorithm attribution are retained in source.
+
+This distribution renames the project to GISClaw and omits demonstration
+datasets, examples, development documents, release notes, and backup files.

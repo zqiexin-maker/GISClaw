@@ -1,0 +1,73 @@
+"""
+vec_kde.py — 核密度估计（KDE）Skill
+"""
+# Copyright (c) 2025 UrbanComp Lab (https://urbancomp.net) — MIT License
+
+SKILL_META = {
+    "name":        "vec_kde",
+    "version":     "1.0.0",
+    "author":      "GeoClaw Team",
+    "description": "核密度估计（KDE）：分析点要素的空间聚集热点，生成密度栅格图",
+    "category":    "vector",
+    "inputs": [
+        {"name": "input",      "type": "GeoLayer", "desc": "输入点图层"},
+        {"name": "bandwidth",  "type": "float",    "desc": "带宽（米，影响平滑程度）", "default": 500.0},
+        {"name": "resolution", "type": "float",    "desc": "输出栅格分辨率（米）",     "default": 100.0},
+        {"name": "weight_col", "type": "str",      "desc": "权重字段（可选，空则等权）", "default": ""},
+    ],
+    "outputs": [
+        {"name": "density", "type": "GeoLayer", "desc": "核密度栅格/矢量结果"},
+        {"name": "report",  "type": "str",       "desc": "密度统计摘要"},
+    ],
+    # ── OpenClaw / AgentSkills 兼容声明（供 skill export 命令使用）
+    "agentskills_compat": {
+        "enabled":            True,
+        "export_description": 'Compute kernel density estimation (KDE) heatmap from point features. Identifies spatial clustering hotspots.',
+        "requires_bins":      ['python3', 'gisclaw'],
+        "requires_env":       [],
+        "homepage":           'https://github.com/zqiexin-maker/GISClaw',
+    },
+}
+
+
+def run(ctx):
+    from gisclaw.analysis.spatial_ops import kde
+
+    layer      = ctx.get_layer("input")
+    bandwidth  = float(ctx.param("bandwidth", 500.0))
+    resolution = float(ctx.param("resolution", 100.0))
+    weight_col = str(ctx.param("weight_col", "")).strip() or None
+
+    print(f"  输入点数   : {len(layer)}")
+    print(f"  带宽       : {bandwidth} 米")
+    print(f"  分辨率     : {resolution} 米")
+    if weight_col:
+        print(f"  权重字段   : {weight_col}")
+
+    # resolution（米）→ grid_size（格数），kde底层只接受 grid_size
+    # 估算：grid_size ≈ 区域跨度(米) / resolution，最小50，最大500
+    grid_size = int(ctx.param("grid_size", 0)) or max(50, min(500, int(100 * 500 / max(resolution, 1))))
+    kwargs = dict(bandwidth=bandwidth, grid_size=grid_size)
+    if weight_col:
+        kwargs["weight_col"] = weight_col
+
+    result = kde(layer, **kwargs)
+
+    report = (
+        f"核密度估计结果\n"
+        f"  输入点数   : {len(layer)}\n"
+        f"  带宽       : {bandwidth} 米\n"
+        f"  分辨率     : {resolution} 米\n"
+        f"  权重字段   : {weight_col or '无（等权）'}\n"
+        f"  输出要素数 : {len(result)}"
+    )
+    print(report)
+
+    ai = ctx.ask_ai(
+        "请分析以下核密度估计参数配置是否合理，并说明热点聚集的空间意义（50-100字）：",
+        context_data=report,
+    )
+    if ai and not ai.startswith("(AI"):
+        report += f"\n\nAI 解读:\n{ai}"
+
+    return ctx.result(density=result, report=report)
